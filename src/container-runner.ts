@@ -233,6 +233,17 @@ async function buildContainerArgs(
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
 
+  // Pass model selection and API base URL if configured
+  if (process.env.CLAUDE_CODE_USE_MODEL) {
+    args.push(
+      '-e',
+      `CLAUDE_CODE_USE_MODEL=${process.env.CLAUDE_CODE_USE_MODEL}`,
+    );
+  }
+  if (process.env.ANTHROPIC_BASE_URL) {
+    args.push('-e', `ANTHROPIC_BASE_URL=${process.env.ANTHROPIC_BASE_URL}`);
+  }
+
   // OneCLI gateway handles credential injection — containers never see real secrets.
   // The gateway intercepts HTTPS traffic and injects API keys or OAuth tokens.
   const onecliApplied = await onecli.applyContainerConfig(args, {

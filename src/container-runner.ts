@@ -243,6 +243,9 @@ async function buildContainerArgs(
   if (process.env.ANTHROPIC_BASE_URL) {
     args.push('-e', `ANTHROPIC_BASE_URL=${process.env.ANTHROPIC_BASE_URL}`);
   }
+  if (process.env.OPENAI_API_KEY) {
+    args.push('-e', `OPENAI_API_KEY=${process.env.OPENAI_API_KEY}`);
+  }
 
   // OneCLI gateway handles credential injection — containers never see real secrets.
   // The gateway intercepts HTTPS traffic and injects API keys or OAuth tokens.

@@ -1,24 +1,37 @@
 /**
  * NanoClaw Agent Runner
- * Runs inside a container, receives config via stdin, outputs result to stdout
+ * Runs inside a container, receives config via stdin, outputs result to stdout.
  *
  * Input protocol:
- *   Stdin: Full ContainerInput JSON (read until EOF, like before)
+ *   Stdin: Full ContainerInput JSON (read until EOF)
  *   IPC:   Follow-up messages written as JSON files to /workspace/ipc/input/
  *          Files: {type:"message", text:"..."}.json — polled and consumed
  *          Sentinel: /workspace/ipc/input/_close — signals session end
  *
  * Stdout protocol:
  *   Each result is wrapped in OUTPUT_START_MARKER / OUTPUT_END_MARKER pairs.
- *   Multiple results may be emitted (one per agent teams result).
+ *   Multiple results may be emitted (one per query result).
  *   Final marker after loop ends signals completion.
  */
 
 import fs from 'fs';
 import path from 'path';
 import { execFile } from 'child_process';
-import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
-import { fileURLToPath } from 'url';
+import OpenAI from 'openai';
+import type { ChatCompletionMessageParam } from 'openai/resources/chat/completions';
+import { coreTools } from './tools.js';
+import { configure, getIpcTools } from './ipc-tools.js';
+import {
+  generateSessionId,
+  loadSession,
+  saveSession,
+  truncateHistory,
+  archiveTranscript,
+} from './session.js';
+
+// ---------------------------------------------------------------------------
+// Interfaces
+// ---------------------------------------------------------------------------
 
 interface ContainerInput {
   prompt: string;
@@ -38,63 +51,27 @@ interface ContainerOutput {
   error?: string;
 }
 
-interface SessionEntry {
-  sessionId: string;
-  fullPath: string;
-  summary: string;
-  firstPrompt: string;
+interface ScriptResult {
+  wakeAgent: boolean;
+  data?: unknown;
 }
 
-interface SessionsIndex {
-  entries: SessionEntry[];
-}
-
-interface SDKUserMessage {
-  type: 'user';
-  message: { role: 'user'; content: string };
-  parent_tool_use_id: null;
-  session_id: string;
-}
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
 
 const IPC_INPUT_DIR = '/workspace/ipc/input';
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_POLL_MS = 500;
+const SCRIPT_TIMEOUT_MS = 30_000;
+const MAX_HISTORY_CHARS = 200_000;
 
-/**
- * Push-based async iterable for streaming user messages to the SDK.
- * Keeps the iterable alive until end() is called, preventing isSingleUserTurn.
- */
-class MessageStream {
-  private queue: SDKUserMessage[] = [];
-  private waiting: (() => void) | null = null;
-  private done = false;
+const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
+const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
 
-  push(text: string): void {
-    this.queue.push({
-      type: 'user',
-      message: { role: 'user', content: text },
-      parent_tool_use_id: null,
-      session_id: '',
-    });
-    this.waiting?.();
-  }
-
-  end(): void {
-    this.done = true;
-    this.waiting?.();
-  }
-
-  async *[Symbol.asyncIterator](): AsyncGenerator<SDKUserMessage> {
-    while (true) {
-      while (this.queue.length > 0) {
-        yield this.queue.shift()!;
-      }
-      if (this.done) return;
-      await new Promise<void>(r => { this.waiting = r; });
-      this.waiting = null;
-    }
-  }
-}
+// ---------------------------------------------------------------------------
+// Core I/O helpers
+// ---------------------------------------------------------------------------
 
 async function readStdin(): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -106,9 +83,6 @@ async function readStdin(): Promise<string> {
   });
 }
 
-const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
-const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
-
 function writeOutput(output: ContainerOutput): void {
   console.log(OUTPUT_START_MARKER);
   console.log(JSON.stringify(output));
@@ -119,149 +93,12 @@ function log(message: string): void {
   console.error(`[agent-runner] ${message}`);
 }
 
-function getSessionSummary(sessionId: string, transcriptPath: string): string | null {
-  const projectDir = path.dirname(transcriptPath);
-  const indexPath = path.join(projectDir, 'sessions-index.json');
-
-  if (!fs.existsSync(indexPath)) {
-    log(`Sessions index not found at ${indexPath}`);
-    return null;
-  }
-
-  try {
-    const index: SessionsIndex = JSON.parse(fs.readFileSync(indexPath, 'utf-8'));
-    const entry = index.entries.find(e => e.sessionId === sessionId);
-    if (entry?.summary) {
-      return entry.summary;
-    }
-  } catch (err) {
-    log(`Failed to read sessions index: ${err instanceof Error ? err.message : String(err)}`);
-  }
-
-  return null;
-}
+// ---------------------------------------------------------------------------
+// IPC helpers
+// ---------------------------------------------------------------------------
 
 /**
- * Archive the full transcript to conversations/ before compaction.
- */
-function createPreCompactHook(assistantName?: string): HookCallback {
-  return async (input, _toolUseId, _context) => {
-    const preCompact = input as PreCompactHookInput;
-    const transcriptPath = preCompact.transcript_path;
-    const sessionId = preCompact.session_id;
-
-    if (!transcriptPath || !fs.existsSync(transcriptPath)) {
-      log('No transcript found for archiving');
-      return {};
-    }
-
-    try {
-      const content = fs.readFileSync(transcriptPath, 'utf-8');
-      const messages = parseTranscript(content);
-
-      if (messages.length === 0) {
-        log('No messages to archive');
-        return {};
-      }
-
-      const summary = getSessionSummary(sessionId, transcriptPath);
-      const name = summary ? sanitizeFilename(summary) : generateFallbackName();
-
-      const conversationsDir = '/workspace/group/conversations';
-      fs.mkdirSync(conversationsDir, { recursive: true });
-
-      const date = new Date().toISOString().split('T')[0];
-      const filename = `${date}-${name}.md`;
-      const filePath = path.join(conversationsDir, filename);
-
-      const markdown = formatTranscriptMarkdown(messages, summary, assistantName);
-      fs.writeFileSync(filePath, markdown);
-
-      log(`Archived conversation to ${filePath}`);
-    } catch (err) {
-      log(`Failed to archive transcript: ${err instanceof Error ? err.message : String(err)}`);
-    }
-
-    return {};
-  };
-}
-
-function sanitizeFilename(summary: string): string {
-  return summary
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 50);
-}
-
-function generateFallbackName(): string {
-  const time = new Date();
-  return `conversation-${time.getHours().toString().padStart(2, '0')}${time.getMinutes().toString().padStart(2, '0')}`;
-}
-
-interface ParsedMessage {
-  role: 'user' | 'assistant';
-  content: string;
-}
-
-function parseTranscript(content: string): ParsedMessage[] {
-  const messages: ParsedMessage[] = [];
-
-  for (const line of content.split('\n')) {
-    if (!line.trim()) continue;
-    try {
-      const entry = JSON.parse(line);
-      if (entry.type === 'user' && entry.message?.content) {
-        const text = typeof entry.message.content === 'string'
-          ? entry.message.content
-          : entry.message.content.map((c: { text?: string }) => c.text || '').join('');
-        if (text) messages.push({ role: 'user', content: text });
-      } else if (entry.type === 'assistant' && entry.message?.content) {
-        const textParts = entry.message.content
-          .filter((c: { type: string }) => c.type === 'text')
-          .map((c: { text: string }) => c.text);
-        const text = textParts.join('');
-        if (text) messages.push({ role: 'assistant', content: text });
-      }
-    } catch {
-    }
-  }
-
-  return messages;
-}
-
-function formatTranscriptMarkdown(messages: ParsedMessage[], title?: string | null, assistantName?: string): string {
-  const now = new Date();
-  const formatDateTime = (d: Date) => d.toLocaleString('en-US', {
-    month: 'short',
-    day: 'numeric',
-    hour: 'numeric',
-    minute: '2-digit',
-    hour12: true
-  });
-
-  const lines: string[] = [];
-  lines.push(`# ${title || 'Conversation'}`);
-  lines.push('');
-  lines.push(`Archived: ${formatDateTime(now)}`);
-  lines.push('');
-  lines.push('---');
-  lines.push('');
-
-  for (const msg of messages) {
-    const sender = msg.role === 'user' ? 'User' : (assistantName || 'Assistant');
-    const content = msg.content.length > 2000
-      ? msg.content.slice(0, 2000) + '...'
-      : msg.content;
-    lines.push(`**${sender}**: ${content}`);
-    lines.push('');
-  }
-
-  return lines.join('\n');
-}
-
-/**
- * Check for _close sentinel.
+ * Check for _close sentinel and consume it if present.
  */
 function shouldClose(): boolean {
   if (fs.existsSync(IPC_INPUT_CLOSE_SENTINEL)) {
@@ -273,7 +110,7 @@ function shouldClose(): boolean {
 
 /**
  * Drain all pending IPC input messages.
- * Returns messages found, or empty array.
+ * Returns message texts found, or empty array.
  */
 function drainIpcInput(): string[] {
   try {
@@ -305,7 +142,7 @@ function drainIpcInput(): string[] {
 
 /**
  * Wait for a new IPC message or _close sentinel.
- * Returns the messages as a single string, or null if _close.
+ * Returns the messages joined as a single string, or null if _close.
  */
 function waitForIpcMessage(): Promise<string | null> {
   return new Promise((resolve) => {
@@ -325,153 +162,9 @@ function waitForIpcMessage(): Promise<string | null> {
   });
 }
 
-/**
- * Run a single query and stream results via writeOutput.
- * Uses MessageStream (AsyncIterable) to keep isSingleUserTurn=false,
- * allowing agent teams subagents to run to completion.
- * Also pipes IPC messages into the stream during the query.
- */
-async function runQuery(
-  prompt: string,
-  sessionId: string | undefined,
-  mcpServerPath: string,
-  containerInput: ContainerInput,
-  sdkEnv: Record<string, string | undefined>,
-  resumeAt?: string,
-): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean }> {
-  const stream = new MessageStream();
-  stream.push(prompt);
-
-  // Poll IPC for follow-up messages and _close sentinel during the query
-  let ipcPolling = true;
-  let closedDuringQuery = false;
-  const pollIpcDuringQuery = () => {
-    if (!ipcPolling) return;
-    if (shouldClose()) {
-      log('Close sentinel detected during query, ending stream');
-      closedDuringQuery = true;
-      stream.end();
-      ipcPolling = false;
-      return;
-    }
-    const messages = drainIpcInput();
-    for (const text of messages) {
-      log(`Piping IPC message into active query (${text.length} chars)`);
-      stream.push(text);
-    }
-    setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
-  };
-  setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
-
-  let newSessionId: string | undefined;
-  let lastAssistantUuid: string | undefined;
-  let messageCount = 0;
-  let resultCount = 0;
-
-  // Load global CLAUDE.md as additional system context (shared across all groups)
-  const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
-  let globalClaudeMd: string | undefined;
-  if (!containerInput.isMain && fs.existsSync(globalClaudeMdPath)) {
-    globalClaudeMd = fs.readFileSync(globalClaudeMdPath, 'utf-8');
-  }
-
-  // Discover additional directories mounted at /workspace/extra/*
-  // These are passed to the SDK so their CLAUDE.md files are loaded automatically
-  const extraDirs: string[] = [];
-  const extraBase = '/workspace/extra';
-  if (fs.existsSync(extraBase)) {
-    for (const entry of fs.readdirSync(extraBase)) {
-      const fullPath = path.join(extraBase, entry);
-      if (fs.statSync(fullPath).isDirectory()) {
-        extraDirs.push(fullPath);
-      }
-    }
-  }
-  if (extraDirs.length > 0) {
-    log(`Additional directories: ${extraDirs.join(', ')}`);
-  }
-
-  for await (const message of query({
-    prompt: stream,
-    options: {
-      cwd: '/workspace/group',
-      additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
-      resume: sessionId,
-      resumeSessionAt: resumeAt,
-      systemPrompt: globalClaudeMd
-        ? { type: 'preset' as const, preset: 'claude_code' as const, append: globalClaudeMd }
-        : undefined,
-      allowedTools: [
-        'Bash',
-        'Read', 'Write', 'Edit', 'Glob', 'Grep',
-        'WebSearch', 'WebFetch',
-        'Task', 'TaskOutput', 'TaskStop',
-        'TeamCreate', 'TeamDelete', 'SendMessage',
-        'TodoWrite', 'ToolSearch', 'Skill',
-        'NotebookEdit',
-        'mcp__nanoclaw__*'
-      ],
-      env: sdkEnv,
-      permissionMode: 'bypassPermissions',
-      allowDangerouslySkipPermissions: true,
-      settingSources: ['project', 'user'],
-      mcpServers: {
-        nanoclaw: {
-          command: 'node',
-          args: [mcpServerPath],
-          env: {
-            NANOCLAW_CHAT_JID: containerInput.chatJid,
-            NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
-            NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
-          },
-        },
-      },
-      hooks: {
-        PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
-      },
-    }
-  })) {
-    messageCount++;
-    const msgType = message.type === 'system' ? `system/${(message as { subtype?: string }).subtype}` : message.type;
-    log(`[msg #${messageCount}] type=${msgType}`);
-
-    if (message.type === 'assistant' && 'uuid' in message) {
-      lastAssistantUuid = (message as { uuid: string }).uuid;
-    }
-
-    if (message.type === 'system' && message.subtype === 'init') {
-      newSessionId = message.session_id;
-      log(`Session initialized: ${newSessionId}`);
-    }
-
-    if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
-      const tn = message as { task_id: string; status: string; summary: string };
-      log(`Task notification: task=${tn.task_id} status=${tn.status} summary=${tn.summary}`);
-    }
-
-    if (message.type === 'result') {
-      resultCount++;
-      const textResult = 'result' in message ? (message as { result?: string }).result : null;
-      log(`Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
-      writeOutput({
-        status: 'success',
-        result: textResult || null,
-        newSessionId
-      });
-    }
-  }
-
-  ipcPolling = false;
-  log(`Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}`);
-  return { newSessionId, lastAssistantUuid, closedDuringQuery };
-}
-
-interface ScriptResult {
-  wakeAgent: boolean;
-  data?: unknown;
-}
-
-const SCRIPT_TIMEOUT_MS = 30_000;
+// ---------------------------------------------------------------------------
+// Script runner
+// ---------------------------------------------------------------------------
 
 async function runScript(script: string): Promise<ScriptResult | null> {
   const scriptPath = '/tmp/task-script.sh';
@@ -515,6 +208,204 @@ async function runScript(script: string): Promise<ScriptResult | null> {
   });
 }
 
+// ---------------------------------------------------------------------------
+// System prompt builder
+// ---------------------------------------------------------------------------
+
+function buildSystemPrompt(containerInput: ContainerInput): string {
+  const parts: string[] = [];
+
+  parts.push(`You are ${containerInput.assistantName || 'Andy'}, a personal assistant.`);
+  parts.push(`Current date: ${new Date().toISOString()}`);
+  parts.push(`Timezone: ${process.env.TZ || 'UTC'}`);
+  parts.push('');
+
+  // Load CLAUDE.md files
+  const claudeMdPaths = ['/workspace/group/CLAUDE.md'];
+  if (!containerInput.isMain) {
+    claudeMdPaths.push('/workspace/global/CLAUDE.md');
+  }
+  // Additional directories
+  const extraBase = '/workspace/extra';
+  if (fs.existsSync(extraBase)) {
+    for (const entry of fs.readdirSync(extraBase)) {
+      const mdPath = path.join(extraBase, entry, 'CLAUDE.md');
+      claudeMdPaths.push(mdPath);
+    }
+  }
+
+  for (const mdPath of claudeMdPaths) {
+    try {
+      if (fs.existsSync(mdPath)) {
+        parts.push(fs.readFileSync(mdPath, 'utf-8'));
+        parts.push('');
+      }
+    } catch { /* ignore unreadable files */ }
+  }
+
+  parts.push('You have access to tools for file operations, running commands, web fetching, and IPC with the host system. Use them as needed to accomplish tasks.');
+
+  return parts.join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// Agent query loop
+// ---------------------------------------------------------------------------
+
+async function runQuery(
+  prompt: string,
+  sessionId: string | undefined,
+  containerInput: ContainerInput,
+): Promise<{ newSessionId?: string; closedDuringQuery: boolean }> {
+  // Build OpenAI client
+  const client = new OpenAI({
+    baseURL: process.env.ANTHROPIC_BASE_URL || process.env.OPENAI_BASE_URL || undefined,
+    apiKey: process.env.OPENAI_API_KEY || process.env.ANTHROPIC_API_KEY || 'dummy',
+  });
+  const model = process.env.CLAUDE_CODE_USE_MODEL || process.env.OPENAI_MODEL || 'anthropic/claude-sonnet-4';
+
+  // Build tool definitions and executor map
+  const allTools = [...coreTools, ...getIpcTools()];
+  const toolDefinitions = allTools.map(t => t.definition);
+  const toolExecutors = new Map<string, (args: Record<string, unknown>) => Promise<string>>();
+  for (const tool of allTools) {
+    toolExecutors.set(tool.definition.function.name, tool.execute);
+  }
+
+  // Session setup
+  const sessionDir = '/workspace/group/.sessions';
+  const currentSessionId = sessionId || generateSessionId();
+
+  // Load existing session history or start fresh
+  let messages: ChatCompletionMessageParam[] = [];
+  if (sessionId) {
+    messages = loadSession(sessionId, sessionDir);
+    log(`Loaded ${messages.length} messages from session ${sessionId}`);
+  }
+
+  // Prepend system prompt (replace existing system message if present)
+  const systemPrompt = buildSystemPrompt(containerInput);
+  if (messages.length > 0 && messages[0].role === 'system') {
+    messages[0] = { role: 'system', content: systemPrompt };
+  } else {
+    messages.unshift({ role: 'system', content: systemPrompt });
+  }
+
+  // Add the user message
+  messages.push({ role: 'user', content: prompt });
+
+  let closedDuringQuery = false;
+
+  // Agent loop
+  while (true) {
+    // Check for _close sentinel
+    if (shouldClose()) {
+      log('Close sentinel detected during query, aborting');
+      closedDuringQuery = true;
+      break;
+    }
+
+    // Drain any queued IPC follow-up messages, add as user messages
+    const followUps = drainIpcInput();
+    for (const text of followUps) {
+      log(`Adding queued IPC follow-up message (${text.length} chars)`);
+      messages.push({ role: 'user', content: text });
+    }
+
+    // Call the API
+    let response: OpenAI.Chat.Completions.ChatCompletion;
+    try {
+      response = await client.chat.completions.create({
+        model,
+        messages,
+        tools: toolDefinitions,
+        temperature: 0.7,
+      });
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      log(`API error: ${errorMessage}`);
+      writeOutput({
+        status: 'error',
+        result: null,
+        newSessionId: currentSessionId,
+        error: errorMessage,
+      });
+      return { newSessionId: currentSessionId, closedDuringQuery: false };
+    }
+
+    const choice = response.choices[0];
+    const assistantMessage = choice.message;
+    messages.push(assistantMessage);
+
+    // Handle tool calls
+    if (assistantMessage.tool_calls && assistantMessage.tool_calls.length > 0) {
+      log(`Handling ${assistantMessage.tool_calls.length} tool call(s)`);
+      for (const toolCall of assistantMessage.tool_calls) {
+        const executor = toolExecutors.get(toolCall.function.name);
+        let result: string;
+        if (executor) {
+          try {
+            const args = JSON.parse(toolCall.function.arguments);
+            result = await executor(args);
+          } catch (err) {
+            result = `Error: ${err instanceof Error ? err.message : String(err)}`;
+          }
+        } else {
+          result = `Unknown tool: ${toolCall.function.name}`;
+        }
+        log(`Tool ${toolCall.function.name} result: ${result.slice(0, 100)}`);
+        messages.push({
+          role: 'tool',
+          tool_call_id: toolCall.id,
+          content: result,
+        });
+      }
+      continue; // Back to top of loop for next API call
+    }
+
+    // Text response (no tool calls) — we have a final result
+    const resultText = typeof assistantMessage.content === 'string'
+      ? assistantMessage.content
+      : null;
+
+    log(`Got text response (${resultText?.length ?? 0} chars)`);
+
+    // Truncate history if it has grown too large before saving
+    const trimmedMessages = truncateHistory(messages, MAX_HISTORY_CHARS);
+    if (trimmedMessages.length < messages.length) {
+      log(`Truncated history from ${messages.length} to ${trimmedMessages.length} messages`);
+    }
+
+    // Save session
+    saveSession(currentSessionId, sessionDir, trimmedMessages);
+
+    // Write output
+    writeOutput({
+      status: 'success',
+      result: resultText,
+      newSessionId: currentSessionId,
+    });
+
+    break; // Result produced, exit the agent loop
+  }
+
+  // Archive transcript on close
+  if (closedDuringQuery && messages.length > 1) {
+    try {
+      const conversationsDir = '/workspace/group/conversations';
+      archiveTranscript(messages, conversationsDir, containerInput.assistantName);
+    } catch (err) {
+      log(`Failed to archive transcript: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  return { newSessionId: currentSessionId, closedDuringQuery };
+}
+
+// ---------------------------------------------------------------------------
+// Main entry point
+// ---------------------------------------------------------------------------
+
 async function main(): Promise<void> {
   let containerInput: ContainerInput;
 
@@ -527,18 +418,15 @@ async function main(): Promise<void> {
     writeOutput({
       status: 'error',
       result: null,
-      error: `Failed to parse input: ${err instanceof Error ? err.message : String(err)}`
+      error: `Failed to parse input: ${err instanceof Error ? err.message : String(err)}`,
     });
     process.exit(1);
   }
 
-  // Credentials are injected by the host's credential proxy via ANTHROPIC_BASE_URL.
-  // No real secrets exist in the container environment.
-  const sdkEnv: Record<string, string | undefined> = { ...process.env };
+  // Configure IPC tools with per-invocation context
+  configure(containerInput.chatJid, containerInput.groupFolder, containerInput.isMain);
 
-  const __dirname = path.dirname(fileURLToPath(import.meta.url));
-  const mcpServerPath = path.join(__dirname, 'ipc-mcp-stdio.js');
-
+  // Session setup
   let sessionId = containerInput.sessionId;
   fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
 
@@ -548,7 +436,7 @@ async function main(): Promise<void> {
   // Build initial prompt (drain any pending IPC messages too)
   let prompt = containerInput.prompt;
   if (containerInput.isScheduledTask) {
-    prompt = `[SCHEDULED TASK - The following message was sent automatically and is not coming directly from the user or group.]\n\n${prompt}`;
+    prompt = `[SCHEDULED TASK]\n\n${prompt}`;
   }
   const pending = drainIpcInput();
   if (pending.length > 0) {
@@ -556,7 +444,7 @@ async function main(): Promise<void> {
     prompt += '\n' + pending.join('\n');
   }
 
-  // Script phase: run script before waking agent
+  // Script phase: run script before waking agent (scheduled tasks only)
   if (containerInput.script && containerInput.isScheduledTask) {
     log('Running task script...');
     const scriptResult = await runScript(containerInput.script);
@@ -564,35 +452,26 @@ async function main(): Promise<void> {
     if (!scriptResult || !scriptResult.wakeAgent) {
       const reason = scriptResult ? 'wakeAgent=false' : 'script error/no output';
       log(`Script decided not to wake agent: ${reason}`);
-      writeOutput({
-        status: 'success',
-        result: null,
-      });
+      writeOutput({ status: 'success', result: null });
       return;
     }
 
     // Script says wake agent — enrich prompt with script data
-    log(`Script wakeAgent=true, enriching prompt with data`);
+    log('Script wakeAgent=true, enriching prompt with data');
     prompt = `[SCHEDULED TASK]\n\nScript output:\n${JSON.stringify(scriptResult.data, null, 2)}\n\nInstructions:\n${containerInput.prompt}`;
   }
 
-  // Query loop: run query → wait for IPC message → run new query → repeat
-  let resumeAt: string | undefined;
+  // Query loop: run query -> wait for IPC message -> run new query -> repeat
   try {
     while (true) {
-      log(`Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`);
+      log(`Starting query (session: ${sessionId || 'new'})...`);
 
-      const queryResult = await runQuery(prompt, sessionId, mcpServerPath, containerInput, sdkEnv, resumeAt);
+      const queryResult = await runQuery(prompt, sessionId, containerInput);
       if (queryResult.newSessionId) {
         sessionId = queryResult.newSessionId;
       }
-      if (queryResult.lastAssistantUuid) {
-        resumeAt = queryResult.lastAssistantUuid;
-      }
 
       // If _close was consumed during the query, exit immediately.
-      // Don't emit a session-update marker (it would reset the host's
-      // idle timer and cause a 30-min delay before the next _close).
       if (queryResult.closedDuringQuery) {
         log('Close sentinel consumed during query, exiting');
         break;
@@ -620,7 +499,7 @@ async function main(): Promise<void> {
       status: 'error',
       result: null,
       newSessionId: sessionId,
-      error: errorMessage
+      error: errorMessage,
     });
     process.exit(1);
   }

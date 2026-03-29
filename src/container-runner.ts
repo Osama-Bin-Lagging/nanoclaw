@@ -178,6 +178,7 @@ function buildVolumeMounts(
   fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'input'), { recursive: true });
+  fs.mkdirSync(path.join(groupIpcDir, 'specialists'), { recursive: true });
   mounts.push({
     hostPath: groupIpcDir,
     containerPath: '/workspace/ipc',
@@ -241,17 +242,20 @@ async function buildContainerArgs(
   args.push('-e', `TZ=${TIMEZONE}`);
 
   // Pass model selection and API base URL if configured
-  const useModel = process.env.CLAUDE_CODE_USE_MODEL || containerEnv.CLAUDE_CODE_USE_MODEL;
+  const useModel =
+    process.env.CLAUDE_CODE_USE_MODEL || containerEnv.CLAUDE_CODE_USE_MODEL;
   if (useModel) {
     args.push('-e', `CLAUDE_CODE_USE_MODEL=${useModel}`);
   }
-  const baseUrl = process.env.ANTHROPIC_BASE_URL || containerEnv.ANTHROPIC_BASE_URL;
+  const baseUrl =
+    process.env.ANTHROPIC_BASE_URL || containerEnv.ANTHROPIC_BASE_URL;
   if (baseUrl) {
     args.push('-e', `ANTHROPIC_BASE_URL=${baseUrl}`);
   }
   // Pass OAuth token so the SDK knows it's authenticated. The actual header
   // injection is handled by the OneCLI proxy's generic secret.
-  const oauthToken = process.env.CLAUDE_CODE_OAUTH_TOKEN || containerEnv.CLAUDE_CODE_OAUTH_TOKEN;
+  const oauthToken =
+    process.env.CLAUDE_CODE_OAUTH_TOKEN || containerEnv.CLAUDE_CODE_OAUTH_TOKEN;
   if (oauthToken) {
     args.push('-e', `CLAUDE_CODE_OAUTH_TOKEN=${oauthToken}`);
   }

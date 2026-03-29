@@ -23,6 +23,11 @@ export interface IpcDeps {
     registeredJids: Set<string>,
   ) => void;
   onTasksChanged: () => void;
+  invokeSpecialist?: (
+    agent: string,
+    prompt: string,
+    sourceGroup: string,
+  ) => Promise<{ output?: string; error?: string }>;
 }
 
 let ipcWatcherRunning = false;
@@ -144,6 +149,62 @@ export function startIpcWatcher(deps: IpcDeps): void {
         }
       } catch (err) {
         logger.error({ err, sourceGroup }, 'Error reading IPC tasks directory');
+      }
+
+      // Process specialist requests from this group's IPC directory
+      if (deps.invokeSpecialist) {
+        const specialistsDir = path.join(
+          ipcBaseDir,
+          sourceGroup,
+          'specialists',
+        );
+        try {
+          if (fs.existsSync(specialistsDir)) {
+            const requestFiles = fs
+              .readdirSync(specialistsDir)
+              .filter(
+                (f) => f.endsWith('.json') && !f.endsWith('.result.json'),
+              );
+            for (const file of requestFiles) {
+              const filePath = path.join(specialistsDir, file);
+              try {
+                const data = JSON.parse(
+                  fs.readFileSync(filePath, 'utf-8'),
+                );
+                if (data.type === 'specialist_request' && data.agent && data.prompt && data.requestId) {
+                  fs.unlinkSync(filePath); // consume request
+                  const result = await deps.invokeSpecialist(
+                    data.agent,
+                    data.prompt,
+                    sourceGroup,
+                  );
+                  // Write result back for the Claude container to find
+                  const resultPath = path.join(
+                    specialistsDir,
+                    `${data.requestId}.result.json`,
+                  );
+                  const tmpPath = resultPath + '.tmp';
+                  fs.writeFileSync(tmpPath, JSON.stringify(result));
+                  fs.renameSync(tmpPath, resultPath);
+                  logger.info(
+                    { agent: data.agent, requestId: data.requestId, sourceGroup },
+                    'Specialist request routed',
+                  );
+                }
+              } catch (err) {
+                logger.error(
+                  { file, sourceGroup, err },
+                  'Error processing specialist request',
+                );
+              }
+            }
+          }
+        } catch (err) {
+          logger.error(
+            { err, sourceGroup },
+            'Error reading IPC specialists directory',
+          );
+        }
       }
     }
 

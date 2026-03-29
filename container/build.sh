@@ -1,23 +1,29 @@
 #!/bin/bash
-# Build the NanoClaw agent container image
+# Build NanoClaw container images
+# Usage: ./build.sh [TAG] [TARGET]
+#   TAG: image tag (default: latest)
+#   TARGET: "all" (default), "agent", or "specialist"
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-IMAGE_NAME="nanoclaw-agent"
 TAG="${1:-latest}"
+TARGET="${2:-all}"
 CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-docker}"
 
-echo "Building NanoClaw agent container image..."
-echo "Image: ${IMAGE_NAME}:${TAG}"
+if [ "$TARGET" = "all" ] || [ "$TARGET" = "agent" ]; then
+  echo "Building NanoClaw agent image..."
+  ${CONTAINER_RUNTIME} build -t "nanoclaw-agent:${TAG}" .
+  echo "Built: nanoclaw-agent:${TAG}"
+fi
 
-${CONTAINER_RUNTIME} build -t "${IMAGE_NAME}:${TAG}" .
+if [ "$TARGET" = "all" ] || [ "$TARGET" = "specialist" ]; then
+  echo "Building NanoClaw specialist image..."
+  ${CONTAINER_RUNTIME} build -t "nanoclaw-specialist:${TAG}" -f Dockerfile.specialist .
+  echo "Built: nanoclaw-specialist:${TAG}"
+fi
 
 echo ""
 echo "Build complete!"
-echo "Image: ${IMAGE_NAME}:${TAG}"
-echo ""
-echo "Test with:"
-echo "  echo '{\"prompt\":\"What is 2+2?\",\"groupFolder\":\"test\",\"chatJid\":\"test@g.us\",\"isMain\":false}' | ${CONTAINER_RUNTIME} run -i ${IMAGE_NAME}:${TAG}"

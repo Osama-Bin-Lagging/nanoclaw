@@ -337,6 +337,83 @@ Use available_groups.json to find the JID for a group. The folder name must be c
   },
 );
 
+// Load available specialists from snapshot (written by host, like current_tasks.json)
+function loadSpecialistsList(): string {
+  const specialistsFile = path.join(IPC_DIR, 'specialists.json');
+  try {
+    if (!fs.existsSync(specialistsFile)) return 'No specialists available.';
+    const agents = JSON.parse(fs.readFileSync(specialistsFile, 'utf-8'));
+    if (agents.length === 0) return 'No specialists available.';
+    return agents
+      .map((a: { name: string; description: string }) => `- ${a.name}: ${a.description}`)
+      .join('\n');
+  } catch {
+    return 'No specialists available.';
+  }
+}
+
+server.tool(
+  'invoke_specialist',
+  `Delegate a task to a specialist agent. Specialists are cheaper/faster models for specific tasks like research, summarization, or code generation. The specialist runs your prompt with its own tools (bash, read, write, edit, grep, web_fetch) and returns the result.
+
+Available specialists:
+${loadSpecialistsList()}
+
+Use this for tasks that don't need Claude's full reasoning.`,
+  {
+    agent: z.string().describe('Name of the specialist agent'),
+    prompt: z.string().describe('The task to delegate. Be specific and self-contained — the specialist has no context from this conversation.'),
+  },
+  async (args) => {
+    const SPECIALISTS_DIR = path.join(IPC_DIR, 'specialists');
+    fs.mkdirSync(SPECIALISTS_DIR, { recursive: true });
+
+    const requestId = `req-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+    // Write request for host to pick up
+    writeIpcFile(SPECIALISTS_DIR, {
+      type: 'specialist_request',
+      requestId,
+      agent: args.agent,
+      prompt: args.prompt,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    });
+
+    // Poll for result (host routes request to specialist container)
+    const resultFile = path.join(SPECIALISTS_DIR, `${requestId}.result.json`);
+    const TIMEOUT = 120_000;
+    const POLL_MS = 500;
+    const start = Date.now();
+
+    while (Date.now() - start < TIMEOUT) {
+      if (fs.existsSync(resultFile)) {
+        try {
+          const result = JSON.parse(fs.readFileSync(resultFile, 'utf-8'));
+          try { fs.unlinkSync(resultFile); } catch { /* ignore */ }
+          if (result.error) {
+            return {
+              content: [{ type: 'text' as const, text: `Specialist error: ${result.error}` }],
+              isError: true,
+            };
+          }
+          return {
+            content: [{ type: 'text' as const, text: result.output || 'Specialist returned empty result.' }],
+          };
+        } catch {
+          // partial write, retry
+        }
+      }
+      await new Promise(r => setTimeout(r, POLL_MS));
+    }
+
+    return {
+      content: [{ type: 'text' as const, text: `Specialist "${args.agent}" timed out after ${TIMEOUT / 1000}s.` }],
+      isError: true,
+    };
+  },
+);
+
 // Start the stdio transport
 const transport = new StdioServerTransport();
 await server.connect(transport);

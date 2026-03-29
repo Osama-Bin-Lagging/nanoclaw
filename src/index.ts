@@ -44,7 +44,7 @@ import {
   storeMessage,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
-import { resolveGroupFolderPath } from './group-folder.js';
+import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
 import {
@@ -52,6 +52,7 @@ import {
   startRemoteControl,
   stopRemoteControl,
 } from './remote-control.js';
+import { SpecialistManager } from './specialist-manager.js';
 import {
   isSenderAllowed,
   isTriggerAllowed,
@@ -73,6 +74,7 @@ let messageLoopRunning = false;
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
+const specialistManager = new SpecialistManager();
 
 const onecli = new OneCLI({ url: ONECLI_URL });
 
@@ -346,6 +348,16 @@ async function runAgent(
     new Set(Object.keys(registeredGroups)),
   );
 
+  // Write specialists snapshot so invoke_specialist tool knows what's available
+  const specialistsFile = path.join(
+    resolveGroupIpcPath(group.folder),
+    'specialists.json',
+  );
+  fs.writeFileSync(
+    specialistsFile,
+    JSON.stringify(specialistManager.getAgentList()),
+  );
+
   // Wrap onOutput to track session ID from streamed results
   const wrappedOnOutput = onOutput
     ? async (output: ContainerOutput) => {
@@ -532,9 +544,13 @@ async function main(): Promise<void> {
 
   restoreRemoteControl();
 
+  // Load specialist agents
+  specialistManager.loadAgents();
+
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
+    await specialistManager.stopAll();
     await queue.shutdown(10000);
     for (const ch of channels) await ch.disconnect();
     process.exit(0);
@@ -696,6 +712,8 @@ async function main(): Promise<void> {
         writeTasksSnapshot(group.folder, group.isMain === true, taskRows);
       }
     },
+    invokeSpecialist: (agent, prompt, sourceGroup) =>
+      specialistManager.invoke(agent, prompt, sourceGroup),
   });
   queue.setProcessMessagesFn(processGroupMessages);
   recoverPendingMessages();

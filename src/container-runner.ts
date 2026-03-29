@@ -16,6 +16,7 @@ import {
   ONECLI_URL,
   TIMEZONE,
 } from './config.js';
+import { readEnvFile } from './env.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
 import {
@@ -29,6 +30,12 @@ import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
 
 const onecli = new OneCLI({ url: ONECLI_URL });
+
+const containerEnv = readEnvFile([
+  'CLAUDE_CODE_USE_MODEL',
+  'ANTHROPIC_BASE_URL',
+  'CLAUDE_CODE_OAUTH_TOKEN',
+]);
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
@@ -234,24 +241,40 @@ async function buildContainerArgs(
   args.push('-e', `TZ=${TIMEZONE}`);
 
   // Pass model selection and API base URL if configured
-  if (process.env.CLAUDE_CODE_USE_MODEL) {
-    args.push(
-      '-e',
-      `CLAUDE_CODE_USE_MODEL=${process.env.CLAUDE_CODE_USE_MODEL}`,
-    );
+  const useModel = process.env.CLAUDE_CODE_USE_MODEL || containerEnv.CLAUDE_CODE_USE_MODEL;
+  if (useModel) {
+    args.push('-e', `CLAUDE_CODE_USE_MODEL=${useModel}`);
   }
-  if (process.env.ANTHROPIC_BASE_URL) {
-    args.push('-e', `ANTHROPIC_BASE_URL=${process.env.ANTHROPIC_BASE_URL}`);
+  const baseUrl = process.env.ANTHROPIC_BASE_URL || containerEnv.ANTHROPIC_BASE_URL;
+  if (baseUrl) {
+    args.push('-e', `ANTHROPIC_BASE_URL=${baseUrl}`);
+  }
+  // Pass OAuth token so the SDK knows it's authenticated. The actual header
+  // injection is handled by the OneCLI proxy's generic secret.
+  const oauthToken = process.env.CLAUDE_CODE_OAUTH_TOKEN || containerEnv.CLAUDE_CODE_OAUTH_TOKEN;
+  if (oauthToken) {
+    args.push('-e', `CLAUDE_CODE_OAUTH_TOKEN=${oauthToken}`);
   }
 
-  // OneCLI gateway handles credential injection — containers never see real secrets.
-  // The gateway intercepts HTTPS traffic and injects API keys or OAuth tokens.
+  // OneCLI gateway handles credential injection, policy rules, and proxy routing.
+  // OAuth token is configured as a generic secret in OneCLI's vault, injected
+  // as Authorization: Bearer header by the proxy.
   const onecliApplied = await onecli.applyContainerConfig(args, {
     addHostMapping: false, // Nanoclaw already handles host gateway
     agent: agentIdentifier,
   });
   if (onecliApplied) {
     logger.info({ containerName }, 'OneCLI gateway config applied');
+    // OneCLI injects ANTHROPIC_API_KEY=placeholder so the SDK routes requests
+    // through the proxy. But the SDK sends that placeholder as an x-api-key
+    // header, which the API rejects. The OneCLI generic secret injects
+    // Authorization: Bearer via the proxy, but x-api-key takes precedence.
+    // Remove the placeholder so the SDK falls back to CLAUDE_CODE_OAUTH_TOKEN
+    // (passed via the proxy's Authorization header injection).
+    const placeholderIdx = args.indexOf('ANTHROPIC_API_KEY=placeholder');
+    if (placeholderIdx !== -1) {
+      args.splice(placeholderIdx - 1, 2);
+    }
   } else {
     logger.warn(
       { containerName },

@@ -172,11 +172,13 @@ We don't want configuration sprawl. Every user should customize NanoClaw so that
 Yes. NanoClaw supports any Claude API-compatible model endpoint. Set these environment variables in your `.env` file:
 
 ```bash
-ANTHROPIC_BASE_URL=https://your-api-endpoint.com
-ANTHROPIC_AUTH_TOKEN=your-token-here
+CLAUDE_CODE_USE_MODEL=claude-sonnet-4-6        # model to use
+CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-...       # OAuth token (from Claude Code)
+ANTHROPIC_BASE_URL=https://your-api-endpoint.com  # optional: custom API endpoint
 ```
 
 This allows you to use:
+- Claude models with OAuth tokens or API keys
 - Local models via [Ollama](https://ollama.ai) with an API proxy
 - Open-source models hosted on [Together AI](https://together.ai), [Fireworks](https://fireworks.ai), etc.
 - Custom model deployments with Anthropic-compatible APIs

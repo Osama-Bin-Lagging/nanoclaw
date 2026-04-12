@@ -35,6 +35,7 @@ const containerEnv = readEnvFile([
   'CLAUDE_CODE_USE_MODEL',
   'ANTHROPIC_BASE_URL',
   'CLAUDE_CODE_OAUTH_TOKEN',
+  'MCP_SERVERS_PATH',
 ]);
 
 // Sentinel markers for robust output parsing (must match agent-runner)
@@ -133,6 +134,11 @@ function buildVolumeMounts(
   fs.mkdirSync(groupSessionsDir, { recursive: true });
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
   if (!fs.existsSync(settingsFile)) {
+    const mcpConfigPath = path.join(process.cwd(), 'container', 'mcp-config.json');
+    let mcpServersConfig: Record<string, unknown> = {};
+    if (fs.existsSync(mcpConfigPath)) {
+      mcpServersConfig = JSON.parse(fs.readFileSync(mcpConfigPath, 'utf-8'));
+    }
     fs.writeFileSync(
       settingsFile,
       JSON.stringify(
@@ -148,6 +154,7 @@ function buildVolumeMounts(
             // https://code.claude.com/docs/en/memory#manage-auto-memory
             CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
           },
+          ...mcpServersConfig,
         },
         null,
         2,
@@ -226,6 +233,17 @@ function buildVolumeMounts(
       isMain,
     );
     mounts.push(...validatedMounts);
+  }
+
+  // Mount MCP servers directory if configured (e.g. for fir-bonds, fir-ratings)
+  // Writable so uv can create/update .venv inside the MCP directories on first run
+  const mcpServersPath = containerEnv.MCP_SERVERS_PATH || process.env.MCP_SERVERS_PATH;
+  if (mcpServersPath && fs.existsSync(mcpServersPath)) {
+    mounts.push({
+      hostPath: mcpServersPath,
+      containerPath: '/workspace/mcp-servers',
+      readonly: false,
+    });
   }
 
   return mounts;

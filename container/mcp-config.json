@@ -1,0 +1,25 @@
+{
+  "mcpServers": {
+    "fir-ratings": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory", "/workspace/mcp-servers/mcps/fir-ratings",
+        "--python", "3.12",
+        "python", "server.py"
+      ]
+    },
+    "fir-bonds": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory", "/workspace/mcp-servers/mcps/fir-bonds",
+        "--python", "3.12",
+        "python", "server.py"
+      ],
+      "env": {
+        "DATABASE_URL": "postgresql://bonds:bonds123@host.docker.internal:5437/bonds"
+      }
+    }
+  }
+}

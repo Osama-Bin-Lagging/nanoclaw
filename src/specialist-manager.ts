@@ -25,6 +25,7 @@ export interface SpecialistAgent {
   apiKey: string; // raw key or "env:VAR_NAME"
   description: string;
   systemPrompt?: string;
+  enabled?: boolean; // default: true
 }
 
 interface RunningSpecialist {
@@ -62,6 +63,10 @@ export class SpecialistManager {
     try {
       const raw = JSON.parse(fs.readFileSync(AGENTS_FILE, 'utf-8'));
       for (const agent of raw as SpecialistAgent[]) {
+        if (agent.enabled === false) {
+          logger.info({ agent: agent.name }, 'Specialist disabled, skipping');
+          continue;
+        }
         this.agents.set(agent.name, agent);
       }
       logger.info(

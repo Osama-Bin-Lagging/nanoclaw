@@ -119,6 +119,23 @@ function log(message: string): void {
   console.error(`[agent-runner] ${message}`);
 }
 
+// Structured JSONL trace log — full raw messages for audit trail
+const TRACE_LOG_PATH = `/workspace/group/logs/agent-trace-${new Date().toISOString().replace(/[:.]/g, '-')}.jsonl`;
+let traceSeq = 0;
+
+function trace(message: unknown): void {
+  traceSeq++;
+  try {
+    fs.mkdirSync('/workspace/group/logs', { recursive: true });
+    fs.appendFileSync(
+      TRACE_LOG_PATH,
+      JSON.stringify({ ts: new Date().toISOString(), seq: traceSeq, raw: message }) + '\n',
+    );
+  } catch {
+    // best-effort — don't crash if logging fails
+  }
+}
+
 function getSessionSummary(sessionId: string, transcriptPath: string): string | null {
   const projectDir = path.dirname(transcriptPath);
   const indexPath = path.join(projectDir, 'sessions-index.json');
@@ -391,6 +408,30 @@ async function runQuery(
     log(`Additional directories: ${extraDirs.join(', ')}`);
   }
 
+  // Validate session transcript exists before attempting to resume.
+  // If the transcript was deleted (cache clear), start fresh rather than failing.
+  if (sessionId) {
+    const transcriptPath = `/home/node/.claude/projects/-workspace-group/${sessionId}.jsonl`;
+    if (!fs.existsSync(transcriptPath)) {
+      log(`Session transcript not found for ${sessionId}, starting fresh session`);
+      sessionId = undefined;
+      resumeAt = undefined;
+    }
+  }
+
+  // Load extra MCP servers from mcp-config.json (mounted from host project at /workspace/project)
+  const mcpConfigPath = '/workspace/project/container/mcp-config.json';
+  let extraMcpServers: Record<string, unknown> = {};
+  if (fs.existsSync(mcpConfigPath)) {
+    try {
+      const cfg = JSON.parse(fs.readFileSync(mcpConfigPath, 'utf-8'));
+      extraMcpServers = cfg.mcpServers ?? {};
+      log(`Loaded ${Object.keys(extraMcpServers).length} extra MCP server(s) from mcp-config.json: ${Object.keys(extraMcpServers).join(', ')}`);
+    } catch (e) {
+      log(`Warning: failed to parse mcp-config.json: ${e}`);
+    }
+  }
+
   for await (const message of query({
     prompt: stream,
     options: {
@@ -409,8 +450,12 @@ async function runQuery(
         'TeamCreate', 'TeamDelete', 'SendMessage',
         'TodoWrite', 'ToolSearch', 'Skill',
         'NotebookEdit',
-        'mcp__nanoclaw__*'
+        'mcp__nanoclaw__*',
+        'mcp__fir-ratings__*',
+        'mcp__fir-bonds__*'
       ],
+      thinking: { type: 'enabled' as const, budgetTokens: 128000 },
+      effort: 'max' as const,
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
       allowDangerouslySkipPermissions: true,
@@ -425,6 +470,7 @@ async function runQuery(
             NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
           },
         },
+        ...extraMcpServers,
       },
       hooks: {
         PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
@@ -435,27 +481,121 @@ async function runQuery(
     const msgType = message.type === 'system' ? `system/${(message as { subtype?: string }).subtype}` : message.type;
     log(`[msg #${messageCount}] type=${msgType}`);
 
-    if (message.type === 'assistant' && 'uuid' in message) {
-      lastAssistantUuid = (message as { uuid: string }).uuid;
+    // Write FULL raw message to JSONL trace (all 19 types)
+    trace(message);
+
+    // === Verbose stderr logging per message type ===
+
+    if (message.type === 'assistant') {
+      if ('uuid' in message) {
+        lastAssistantUuid = (message as { uuid: string }).uuid;
+      }
+      const msg = message as { message?: { content?: Array<{ type: string; name?: string; input?: unknown; text?: string; thinking?: string; id?: string }> }; error?: string };
+      if (msg.error) {
+        log(`  ❌ assistant error: ${msg.error}`);
+      }
+      if (msg.message?.content) {
+        for (const block of msg.message.content) {
+          if (block.type === 'tool_use') {
+            const inputStr = JSON.stringify(block.input || {}).slice(0, 300);
+            log(`  → tool_use: ${block.name}(${inputStr})`);
+          } else if (block.type === 'thinking' && block.thinking) {
+            log(`  💭 thinking: ${block.thinking.slice(0, 200)}`);
+          } else if (block.type === 'text' && block.text) {
+            log(`  → text: ${block.text.slice(0, 200)}`);
+          }
+        }
+      }
     }
 
-    if (message.type === 'system' && message.subtype === 'init') {
-      newSessionId = message.session_id;
-      log(`Session initialized: ${newSessionId}`);
+    if (message.type === 'user') {
+      const msg = message as { message?: { content?: Array<{ type: string; tool_use_id?: string; content?: string | unknown[]; is_error?: boolean }> } };
+      if (msg.message?.content) {
+        for (const block of msg.message.content) {
+          if (block.type === 'tool_result') {
+            const contentStr = typeof block.content === 'string' ? block.content.slice(0, 300) : JSON.stringify(block.content).slice(0, 300);
+            log(`  ← tool_result (${block.tool_use_id?.slice(0, 12)})${block.is_error ? ' [ERROR]' : ''}: ${contentStr}`);
+          }
+        }
+      }
     }
 
-    if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
-      const tn = message as { task_id: string; status: string; summary: string };
-      log(`Task notification: task=${tn.task_id} status=${tn.status} summary=${tn.summary}`);
+    if (message.type === 'system') {
+      const subtype = (message as { subtype?: string }).subtype;
+
+      if (subtype === 'init') {
+        newSessionId = message.session_id;
+        const init = message as { model?: string; tools?: string[]; cwd?: string };
+        log(`  Session: ${newSessionId} | model: ${init.model || 'default'} | tools: ${init.tools?.length || 0} | cwd: ${init.cwd || ''}`);
+      } else if (subtype === 'task_started') {
+        const ts = message as { task_id?: string; description?: string; task_type?: string };
+        log(`  ⚡ subagent started: ${ts.task_id || '?'} — ${ts.description || ''} (${ts.task_type || 'task'})`);
+      } else if (subtype === 'task_progress') {
+        const tp = message as { task_id?: string; last_tool_name?: string; usage?: { total_tokens?: number; tool_uses?: number; duration_ms?: number } };
+        log(`  … subagent progress (${tp.task_id?.slice(0, 12)}): tool=${tp.last_tool_name || '?'} tokens=${tp.usage?.total_tokens || '?'} tools=${tp.usage?.tool_uses || '?'} ${tp.usage?.duration_ms ? `${Math.round(tp.usage.duration_ms / 1000)}s` : ''}`);
+      } else if (subtype === 'task_notification') {
+        const tn = message as { task_id: string; status: string; summary: string; usage?: { total_tokens?: number } };
+        log(`  ✓ subagent done: ${tn.task_id} status=${tn.status} tokens=${tn.usage?.total_tokens || '?'} summary=${tn.summary.slice(0, 200)}`);
+      } else if (subtype === 'status') {
+        const st = message as { status?: string; permissionMode?: string };
+        log(`  📊 status: ${st.status || 'null'} mode=${st.permissionMode || '?'}`);
+      } else if (subtype === 'compact_boundary') {
+        const cb = message as { compact_metadata?: { trigger?: string; pre_tokens?: number } };
+        log(`  🗜️ compact: trigger=${cb.compact_metadata?.trigger || '?'} pre_tokens=${cb.compact_metadata?.pre_tokens || '?'}`);
+      } else if (subtype === 'hook_started') {
+        const hs = message as { hook_name?: string; hook_event?: string };
+        log(`  🪝 hook started: ${hs.hook_name || '?'} event=${hs.hook_event || '?'}`);
+      } else if (subtype === 'hook_progress') {
+        const hp = message as { hook_name?: string; stdout?: string; stderr?: string };
+        log(`  🪝 hook progress: ${hp.hook_name || '?'} stdout=${(hp.stdout || '').slice(0, 100)}`);
+      } else if (subtype === 'hook_response') {
+        const hr = message as { hook_event?: string; output?: string };
+        log(`  🪝 hook done: ${hr.hook_event || '?'} output=${(hr.output || '').slice(0, 100)}`);
+      }
+    }
+
+    if (message.type === 'rate_limit_event') {
+      const rl = message as { rate_limit_info?: { status?: string; resetsAt?: string; utilization?: number } };
+      log(`  ⏳ rate_limit: status=${rl.rate_limit_info?.status || '?'} resets=${rl.rate_limit_info?.resetsAt || '?'} util=${rl.rate_limit_info?.utilization || '?'}`);
+    }
+
+    if (message.type === 'tool_progress') {
+      const tp = message as { tool_name?: string; tool_use_id?: string; elapsed_time_seconds?: number };
+      log(`  ⏱️ tool_progress: ${tp.tool_name || '?'} (${tp.tool_use_id?.slice(0, 12)}) ${tp.elapsed_time_seconds || 0}s`);
+    }
+
+    if (message.type === 'auth_status') {
+      const auth = message as { isAuthenticating?: boolean; error?: string };
+      log(`  🔑 auth: authenticating=${auth.isAuthenticating} error=${auth.error || 'none'}`);
     }
 
     if (message.type === 'result') {
       resultCount++;
-      const textResult = 'result' in message ? (message as { result?: string }).result : null;
-      log(`Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
+      const r = message as unknown as {
+        subtype: string; result?: string; total_cost_usd?: number;
+        num_turns?: number; duration_ms?: number; duration_api_ms?: number;
+        stop_reason?: string;
+        usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number };
+        modelUsage?: Record<string, { costUSD?: number; inputTokens?: number; outputTokens?: number }>;
+        permission_denials?: Array<{ tool?: string; reason?: string }>;
+      };
+      log(`  💰 result: subtype=${r.subtype} cost=$${r.total_cost_usd?.toFixed(4) || '?'} turns=${r.num_turns || '?'} duration=${r.duration_ms ? Math.round(r.duration_ms / 1000) + 's' : '?'} stop=${r.stop_reason || '?'}`);
+      if (r.usage) {
+        log(`     tokens: in=${r.usage.input_tokens || 0} out=${r.usage.output_tokens || 0} cache_read=${r.usage.cache_read_input_tokens || 0}`);
+      }
+      if (r.modelUsage) {
+        for (const [model, usage] of Object.entries(r.modelUsage)) {
+          log(`     model ${model}: $${usage.costUSD?.toFixed(4) || '?'} in=${usage.inputTokens || 0} out=${usage.outputTokens || 0}`);
+        }
+      }
+      if (r.permission_denials && r.permission_denials.length > 0) {
+        log(`     ⚠️ permission denials: ${r.permission_denials.map(d => `${d.tool}: ${d.reason}`).join(', ')}`);
+      }
+      const textResult = r.result || null;
+      log(`Result #${resultCount}: ${textResult ? textResult.slice(0, 200) : '(no text)'}`);
       writeOutput({
         status: 'success',
-        result: textResult || null,
+        result: textResult,
         newSessionId
       });
     }

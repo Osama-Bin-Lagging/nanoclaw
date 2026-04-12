@@ -26,14 +26,6 @@ RUN apt-get update && apt-get install -y \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-# Install uv (Python package manager) for MCP servers
-RUN curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh
-
-# Pre-install Python 3.12 for MCP servers (fir-ratings + fir-bonds require >=3.12)
-# Install to a globally accessible path so the non-root node user can find it at runtime
-ENV UV_PYTHON_INSTALL_DIR=/usr/local/share/uv/python
-RUN uv python install 3.12
-
 # Set Chromium path for agent-browser
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium

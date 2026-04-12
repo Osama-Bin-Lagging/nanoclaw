@@ -35,7 +35,6 @@ const containerEnv = readEnvFile([
   'CLAUDE_CODE_USE_MODEL',
   'ANTHROPIC_BASE_URL',
   'CLAUDE_CODE_OAUTH_TOKEN',
-  'MCP_SERVERS_PATH',
 ]);
 
 // Sentinel markers for robust output parsing (must match agent-runner)
@@ -233,17 +232,6 @@ function buildVolumeMounts(
       isMain,
     );
     mounts.push(...validatedMounts);
-  }
-
-  // Mount MCP servers directory if configured (e.g. for fir-bonds, fir-ratings)
-  // Writable so uv can create/update .venv inside the MCP directories on first run
-  const mcpServersPath = containerEnv.MCP_SERVERS_PATH || process.env.MCP_SERVERS_PATH;
-  if (mcpServersPath && fs.existsSync(mcpServersPath)) {
-    mounts.push({
-      hostPath: mcpServersPath,
-      containerPath: '/workspace/mcp-servers',
-      readonly: false,
-    });
   }
 
   return mounts;

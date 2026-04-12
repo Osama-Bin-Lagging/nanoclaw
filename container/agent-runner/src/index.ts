@@ -450,12 +450,8 @@ async function runQuery(
         'TeamCreate', 'TeamDelete', 'SendMessage',
         'TodoWrite', 'ToolSearch', 'Skill',
         'NotebookEdit',
-        'mcp__nanoclaw__*',
-        'mcp__fir-ratings__*',
-        'mcp__fir-bonds__*'
+        'mcp__nanoclaw__*'
       ],
-      thinking: { type: 'enabled' as const, budgetTokens: 128000 },
-      effort: 'max' as const,
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
       allowDangerouslySkipPermissions: true,
